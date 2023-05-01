@@ -1,0 +1,275 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+x-superset-image: &superset-image apache/superset:${TAG:-latest-dev}
+x-superset-depends-on: &superset-depends-on
+  - db
+  - redis
+x-superset-volumes:
+  &superset-volumes # /app/pythonpath_docker will be appended to the PYTHONPATH in the final container
+  - ./docker:/app/docker
+  - superset_home:/app/superset_home
+
+version: "3.7"
+services:
+  redis:
+    image: redis:7
+    container_name: superset_cache
+    restart: unless-stopped
+    volumes:
+      - redis:/data
+  impala:
+    container_name: kudu-impala
+    network_mode: superset_default
+    ports:
+      - "21000:21000"
+      - "21050:21050"
+      - "25000:25000"
+      - "25010:25010"
+      - "25020:25020"
+    image: apache/kudu:impala-latest
+    command: impala
+  db:
+    env_file: docker/.env-non-dev
+    image: postgres:14
+    container_name: superset_db
+    restart: unless-stopped
+    volumes:
+      - db_home:/var/lib/postgresql/data
+
+  superset:
+    env_file: docker/.env-non-dev
+    image: *superset-image
+    container_name: superset_app
+    command: ["/app/docker/docker-bootstrap.sh", "app-gunicorn"]
+    user: "root"
+    restart: unless-stopped
+    ports:
+      - 8088:8088
+    depends_on: *superset-depends-on
+    volumes: *superset-volumes
+
+  superset-init:
+    image: *superset-image
+    container_name: superset_init
+    command: ["/app/docker/docker-init.sh"]
+    env_file: docker/.env-non-dev
+    depends_on: *superset-depends-on
+    user: "root"
+    volumes: *superset-volumes
+    healthcheck:
+      disable: true
+
+  superset-worker:
+    image: *superset-image
+    container_name: superset_worker
+    command: ["/app/docker/docker-bootstrap.sh", "worker"]
+    env_file: docker/.env-non-dev
+    restart: unless-stopped
+    depends_on: *superset-depends-on
+    user: "root"
+    volumes: *superset-volumes
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "celery -A superset.tasks.celery_app:app inspect ping -d celery@$$HOSTNAME",
+        ]
+
+  superset-worker-beat:
+    image: *superset-image
+    container_name: superset_worker_beat
+    command: ["/app/docker/docker-bootstrap.sh", "beat"]
+    env_file: docker/.env-non-dev
+    restart: unless-stopped
+    depends_on: *superset-depends-on
+    user: "root"
+    volumes: *superset-volumes
+    healthcheck:
+      disable: true
+
+  kudu-master-1:
+    image: apache/kudu:${KUDU_QUICKSTART_VERSION:-latest}
+    ports:
+      - "7051:7051"
+      - "8051:8051"
+    command: ["master"]
+    environment:
+      - KUDU_MASTERS=kudu-master-1:7051,kudu-master-2:7151,kudu-master-3:7251
+      # TODO: Use `host.docker.internal` instead of KUDU_QUICKSTART_IP when it
+      # works on Linux (https://github.com/docker/for-linux/issues/264)
+      - >
+        MASTER_ARGS=--fs_wal_dir=/var/lib/kudu/master
+        --rpc_bind_addresses=0.0.0.0:7051
+        --rpc_advertised_addresses=${KUDU_QUICKSTART_IP:?Please set KUDU_QUICKSTART_IP environment variable}:7051
+        --webserver_port=8051
+        --webserver_advertised_addresses=${KUDU_QUICKSTART_IP}:8051
+        --webserver_doc_root=/opt/kudu/www
+        --stderrthreshold=0
+        --use_hybrid_clock=false
+        --unlock_unsafe_flags=true
+
+  kudu-master-2:
+    image: apache/kudu:${KUDU_QUICKSTART_VERSION:-latest}
+    ports:
+      - "7151:7151"
+      - "8151:8151"
+    command: ["master"]
+    environment:
+      - KUDU_MASTERS=kudu-master-1:7051,kudu-master-2:7151,kudu-master-3:7251
+      - >
+        MASTER_ARGS=--fs_wal_dir=/var/lib/kudu/master
+        --rpc_bind_addresses=0.0.0.0:7151
+        --rpc_advertised_addresses=${KUDU_QUICKSTART_IP}:7151
+        --webserver_port=8151
+        --webserver_advertised_addresses=${KUDU_QUICKSTART_IP}:8151
+        --webserver_doc_root=/opt/kudu/www
+        --stderrthreshold=0
+        --use_hybrid_clock=false
+        --unlock_unsafe_flags=true
+  kudu-master-3:
+    image: apache/kudu:${KUDU_QUICKSTART_VERSION:-latest}
+    ports:
+      - "7251:7251"
+      - "8251:8251"
+    command: ["master"]
+    environment:
+      - KUDU_MASTERS=kudu-master-1:7051,kudu-master-2:7151,kudu-master-3:7251
+      - >
+        MASTER_ARGS=--fs_wal_dir=/var/lib/kudu/master
+        --rpc_bind_addresses=0.0.0.0:7251
+        --rpc_advertised_addresses=${KUDU_QUICKSTART_IP}:7251
+        --webserver_port=8251
+        --webserver_advertised_addresses=${KUDU_QUICKSTART_IP}:8251
+        --webserver_doc_root=/opt/kudu/www
+        --stderrthreshold=0
+        --use_hybrid_clock=false
+        --unlock_unsafe_flags=true
+  kudu-tserver-1:
+    image: apache/kudu:${KUDU_QUICKSTART_VERSION:-latest}
+    depends_on:
+      - kudu-master-1
+      - kudu-master-2
+      - kudu-master-3
+    ports:
+      - "7050:7050"
+      - "8050:8050"
+    command: ["tserver"]
+    volumes:
+      - kudu-tserver-1:/var/lib/kudu
+    environment:
+      - KUDU_MASTERS=kudu-master-1:7051,kudu-master-2:7151,kudu-master-3:7251
+      - >
+        TSERVER_ARGS=--fs_wal_dir=/var/lib/kudu/tserver
+        --rpc_bind_addresses=0.0.0.0:7050
+        --rpc_advertised_addresses=${KUDU_QUICKSTART_IP}:7050
+        --webserver_port=8050
+        --webserver_advertised_addresses=${KUDU_QUICKSTART_IP}:8050
+        --webserver_doc_root=/opt/kudu/www
+        --stderrthreshold=0
+        --use_hybrid_clock=false
+        --unlock_unsafe_flags=true
+  kudu-tserver-2:
+    image: apache/kudu:${KUDU_QUICKSTART_VERSION:-latest}
+    depends_on:
+      - kudu-master-1
+      - kudu-master-2
+      - kudu-master-3
+    ports:
+      - "7150:7150"
+      - "8150:8150"
+    command: ["tserver"]
+    environment:
+      - KUDU_MASTERS=kudu-master-1:7051,kudu-master-2:7151,kudu-master-3:7251
+      - >
+        TSERVER_ARGS=--fs_wal_dir=/var/lib/kudu/tserver
+        --rpc_bind_addresses=0.0.0.0:7150
+        --rpc_advertised_addresses=${KUDU_QUICKSTART_IP}:7150
+        --webserver_port=8150
+        --webserver_advertised_addresses=${KUDU_QUICKSTART_IP}:8150
+        --webserver_doc_root=/opt/kudu/www
+        --stderrthreshold=0
+        --use_hybrid_clock=false
+        --unlock_unsafe_flags=true
+  kudu-tserver-3:
+    image: apache/kudu:${KUDU_QUICKSTART_VERSION:-latest}
+    depends_on:
+      - kudu-master-1
+      - kudu-master-2
+      - kudu-master-3
+    ports:
+      - "7250:7250"
+      - "8250:8250"
+    command: ["tserver"]
+    environment:
+      - KUDU_MASTERS=kudu-master-1:7051,kudu-master-2:7151,kudu-master-3:7251
+      - >
+        TSERVER_ARGS=--fs_wal_dir=/var/lib/kudu/tserver
+        --rpc_bind_addresses=0.0.0.0:7250
+        --rpc_advertised_addresses=${KUDU_QUICKSTART_IP}:7250
+        --webserver_port=8250
+        --webserver_advertised_addresses=${KUDU_QUICKSTART_IP}:8250
+        --webserver_doc_root=/opt/kudu/www
+        --stderrthreshold=0
+        --use_hybrid_clock=false
+        --unlock_unsafe_flags=true
+  kudu-tserver-4:
+    image: apache/kudu:${KUDU_QUICKSTART_VERSION:-latest}
+    depends_on:
+      - kudu-master-1
+      - kudu-master-2
+      - kudu-master-3
+    ports:
+      - "7350:7350"
+      - "8350:8350"
+    command: ["tserver"]
+    environment:
+      - KUDU_MASTERS=kudu-master-1:7051,kudu-master-2:7151,kudu-master-3:7251
+      - >
+        TSERVER_ARGS=--fs_wal_dir=/var/lib/kudu/tserver
+        --rpc_bind_addresses=0.0.0.0:7350
+        --rpc_advertised_addresses=${KUDU_QUICKSTART_IP}:7350
+        --webserver_port=8350
+        --webserver_advertised_addresses=${KUDU_QUICKSTART_IP}:8350
+        --webserver_doc_root=/opt/kudu/www
+        --stderrthreshold=0
+        --use_hybrid_clock=false
+        --unlock_unsafe_flags=true
+  kudu-tserver-5:
+    image: apache/kudu:${KUDU_QUICKSTART_VERSION:-latest}
+    depends_on:
+      - kudu-master-1
+      - kudu-master-2
+      - kudu-master-3
+    ports:
+      - "7450:7450"
+      - "8450:8450"
+    command: ["tserver"]
+volumes:
+  kudu-master-1:
+  kudu-master-2:
+  kudu-master-3:
+  kudu-tserver-1:
+  kudu-tserver-2:
+  kudu-tserver-3:
+  kudu-tserver-4:
+  kudu-tserver-5:
+  superset_home:
+    external: false
+  db_home:
+    external: false
+  redis:
+    external: false
